@@ -1,0 +1,113 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import mysql.connector
+import os
+from datetime import datetime
+
+class Pins(commands.Cog):
+    """メッセージピン留め管理コグ"""
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # __init__内でDB接続を確立
+        self.conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME"),
+            port=int(os.getenv("DB_PORT", 3306))
+        )
+        self.cursor = self.conn.cursor()
+
+    # -----------------------------
+    # /pin（スラッシュコマンド）
+    # -----------------------------
+    @app_commands.command(
+        name="pin",
+        description="メッセージをデータベースにピン留めします。"
+    )
+    @app_commands.describe(
+        message_id="ピン留めするメッセージのID"
+    )
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def pin_command(self, interaction: discord.Interaction, message_id: str):
+        try:
+            message_id = int(message_id)
+        except ValueError:
+            await interaction.response.send_message("無効なメッセージIDです。", ephemeral=True)
+            return
+
+        try:
+            # メッセージIDからメッセージを取得
+            target_message = await interaction.channel.fetch_message(message_id)
+        except discord.NotFound:
+            await interaction.response.send_message("指定されたメッセージが見つかりません。", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.response.send_message("このチャンネルのメッセージを読み取る権限がありません。", ephemeral=True)
+            return
+
+        # データベースにメッセージを挿入
+        query = """
+        INSERT INTO pinned_messages (message_id, guild_id, channel_id, author_id, pinned_by_id, content, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE content = VALUES(content), pinned_by_id = VALUES(pinned_by_id), created_at = VALUES(created_at)
+        """
+        values = (
+            target_message.id,
+            interaction.guild.id,
+            interaction.channel.id,
+            target_message.author.id,
+            interaction.user.id,
+            target_message.content,
+            datetime.now()
+        )
+        try:
+            self.cursor.execute(query, values)
+            self.conn.commit()
+            await interaction.response.send_message(f"メッセージをピン留めしました！\n投稿者: {target_message.author.mention}\n内容: {target_message.content[:200]}...", ephemeral=True)
+        except mysql.connector.Error as err:
+            self.conn.rollback()
+            await interaction.response.send_message(f"データベースエラーが発生しました: {err}", ephemeral=True)
+
+    # -----------------------------
+    # /pins（スラッシュコマンド）
+    # -----------------------------
+    @app_commands.command(
+        name="pins",
+        description="このチャンネルにピン留めされたメッセージを一覧表示します。"
+    )
+    async def pins_list(self, interaction: discord.Interaction):
+        query = "SELECT author_id, content, created_at FROM pinned_messages WHERE channel_id = %s ORDER BY created_at DESC LIMIT 10"
+        self.cursor.execute(query, (interaction.channel.id,))
+        results = self.cursor.fetchall()
+
+        if not results:
+            await interaction.response.send_message("このチャンネルにはピン留めされたメッセージがありません。", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"📌 {interaction.channel.name}のピン留めメッセージ",
+            color=discord.Color.blue()
+        )
+
+        for author_id, content, created_at in results:
+            author = self.bot.get_user(author_id) or f"不明なユーザー (ID: {author_id})"
+            # フィールド名の長さを制限
+            title_field = f"{author} - {created_at.strftime('%Y-%m-%d %H:%M')}"
+            embed.add_field(name=title_field, value=content[:1024], inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -----------------------------
+    # 既存のDB接続を再利用する
+    # -----------------------------
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self.conn.is_connected():
+            self.conn.reconnect()
+            self.cursor = self.conn.cursor()
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Pins(bot))
